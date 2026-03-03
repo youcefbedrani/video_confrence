@@ -1506,6 +1506,7 @@ class App(tk.Tk):
         self._log("  Checking for Linux distro...", "dim")
         distro = get_wsl_distro()
         # Double check with wsl -l -v
+        _, out, _ = run_cmd("wsl -l -v")
         if "Ubuntu" not in out:
             self._log("  ! Ubuntu not found, installing (takes 5m+)...", "warn")
             self._status("Installing Ubuntu distro...")
@@ -1514,10 +1515,10 @@ class App(tk.Tk):
             cmd = ["wsl", "--install", "-d", "Ubuntu", "--no-launch"]
             try:
                 self._log("  Starting wsl --install...", "dim")
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creator_flags=0x08000000 if IS_WINDOWS else 0)
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=0x08000000 if IS_WINDOWS else 0)
                 
                 # Wait loop with feedback
-                for i in range(120): # Up to 10 minutes polling
+                for i in range(150): # Up to 12.5 minutes polling
                     if self.abort_flag:
                         process.terminate()
                         return False
@@ -1525,24 +1526,28 @@ class App(tk.Tk):
                     # Check if process finished
                     ret = process.poll()
                     if ret is not None:
-                        out, err = process.communicate()
+                        stdout, stderr = process.communicate()
                         if ret == 0:
                             self._log("  ✅  Distro installation command finished", "ok")
                         else:
-                            self._log(f"  ⚠  Installation finished with code {ret}: {err or out}", "warn")
+                            # Detect specific network error 0x80072efe
+                            if "0x80072efe" in (stderr + stdout):
+                                self._log("  ❌  Network Error (0x80072efe): Connection interrupted.", "error")
+                                self._log("      Please check your internet and disable any VPN/Firewall.", "warn")
+                                return False
+                            self._log(f"  ⚠  Installation finished with code {ret}: {stderr or stdout}", "warn")
                         break
                     
                     # Periodically check if "Ubuntu" appeared in wsl -l -v even if command is still running
-                    # (Sometimes wsl --install hangs at the end but distro is actually there)
                     c_check, o_check, _ = run_cmd("wsl -l -v")
                     if "Ubuntu" in o_check:
                         self._log("  ✅  Ubuntu detected in system list", "ok")
                         break
                         
-                    self._status(f"Installing Ubuntu... {i*5}s")
+                    self._status(f"Installing Ubuntu... {i*5}s (Please don't close)")
                     time.sleep(5)
                 else:
-                    self._log("  ⚠  Installation is taking a long time, continuing to wait for registration...", "warn")
+                    self._log("  ⚠  Installation taking too long. Check 'wsl --status' manually.", "warn")
             except Exception as e:
                 self._log(f"  ❌  Failed to start installation: {e}", "error")
                 return False
