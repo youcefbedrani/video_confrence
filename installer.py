@@ -118,11 +118,22 @@ def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
         # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
+        if hasattr(sys, '_MEIPASS'):
+            base_path = sys._MEIPASS
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
     except Exception:
         base_path = os.path.abspath(".")
 
-    return Path(base_path) / relative_path
+    # If it's a Path object, use it directly, else wrap it
+    target = Path(base_path) / relative_path
+    if not target.exists():
+        # Last resort fallback to current directory
+        alt_target = Path(os.getcwd()) / relative_path
+        if alt_target.exists():
+            return alt_target
+            
+    return target
 
 def to_wsl_path(win_path):
     """Convert a Windows path like C:\\Foo to /mnt/c/Foo."""
@@ -728,9 +739,18 @@ class App(tk.Tk):
             
             # Load and resize logo
             logo_path = resource_path("logo.png")
+            
+            # Additional fallback checks
             if not logo_path.exists():
-                # Try sibling path if in dev
-                logo_path = Path(__file__).parent.parent / "logo.png"
+                search_paths = [
+                    Path(__file__).parent / "logo.png",
+                    Path(__file__).parent.parent / "logo.png",
+                    Path(os.path.dirname(sys.executable)) / "logo.png" if getattr(sys, 'frozen', False) else None
+                ]
+                for p in search_paths:
+                    if p and p.exists():
+                        logo_path = p
+                        break
 
             if logo_path.exists():
                 img = Image.open(logo_path)
@@ -744,6 +764,7 @@ class App(tk.Tk):
                 raise FileNotFoundError(f"Logo not found at {logo_path}")
         except Exception as e:
             self._log(f"  ⚠  Logo load failure: {e}", "dim")
+            self._log(f"  (Searched: {logo_path})", "dim")
             # Fallback to emoji if logo fails
             tk.Label(logo_frame, text="☁",
                      font=("Segoe UI Emoji", 36),
@@ -1485,16 +1506,46 @@ class App(tk.Tk):
         self._log("  Checking for Linux distro...", "dim")
         distro = get_wsl_distro()
         # Double check with wsl -l -v
-        code, out, _ = run_cmd("wsl -l -v")
         if "Ubuntu" not in out:
-            self._log("  ! Ubuntu not found, installing (takes 5m)...", "warn")
+            self._log("  ! Ubuntu not found, installing (takes 5m+)...", "warn")
             self._status("Installing Ubuntu distro...")
-            # Try install with retries
-            for attempt in range(2):
-                self._log(f"  Installation attempt {attempt+1}...", "dim")
-                c, o, e = run_cmd("wsl --install -d Ubuntu --no-launch", timeout=900)
-                if c == 0: break
-                self._log(f"  ⚠  Attempt {attempt+1} failed: {e or o}", "warn")
+            
+            # Using Popen to allow background check and status updates
+            cmd = ["wsl", "--install", "-d", "Ubuntu", "--no-launch"]
+            try:
+                self._log("  Starting wsl --install...", "dim")
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creator_flags=0x08000000 if IS_WINDOWS else 0)
+                
+                # Wait loop with feedback
+                for i in range(120): # Up to 10 minutes polling
+                    if self.abort_flag:
+                        process.terminate()
+                        return False
+                    
+                    # Check if process finished
+                    ret = process.poll()
+                    if ret is not None:
+                        out, err = process.communicate()
+                        if ret == 0:
+                            self._log("  ✅  Distro installation command finished", "ok")
+                        else:
+                            self._log(f"  ⚠  Installation finished with code {ret}: {err or out}", "warn")
+                        break
+                    
+                    # Periodically check if "Ubuntu" appeared in wsl -l -v even if command is still running
+                    # (Sometimes wsl --install hangs at the end but distro is actually there)
+                    c_check, o_check, _ = run_cmd("wsl -l -v")
+                    if "Ubuntu" in o_check:
+                        self._log("  ✅  Ubuntu detected in system list", "ok")
+                        break
+                        
+                    self._status(f"Installing Ubuntu... {i*5}s")
+                    time.sleep(5)
+                else:
+                    self._log("  ⚠  Installation is taking a long time, continuing to wait for registration...", "warn")
+            except Exception as e:
+                self._log(f"  ❌  Failed to start installation: {e}", "error")
+                return False
             
             # Wait for distro to be registered and ready
             self._log("  Waiting for distro registration...", "dim")

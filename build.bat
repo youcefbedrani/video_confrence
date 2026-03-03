@@ -17,7 +17,7 @@ echo  [1/2] Installing Dependencies...
 python -m pip install pyinstaller cryptography Pillow --quiet --upgrade
 
 echo  [2/3] Generating App Icon...
-python -c "from PIL import Image; Image.open('../logo.png').save('logo.ico', format='ICO', sizes=[(256, 256)])"
+python -c "from PIL import Image; Image.open('logo.png').save('logo.ico', format='ICO', sizes=[(256, 256)])"
 
 echo  [3/3] Building .exe...
 python -m PyInstaller ^
@@ -27,7 +27,7 @@ python -m PyInstaller ^
     --clean ^
     --name "NextcloudInstaller" ^
     --icon "logo.ico" ^
-    --add-data "../logo.png;." ^
+    --add-data "logo.png;." ^
     --collect-all cryptography ^
     --collect-all PIL ^
     installer.py
