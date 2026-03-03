@@ -293,14 +293,40 @@ def is_docker_running():
     return code == 0
 
 def gen_ssl_cert(ip, cert_path, key_path):
-    """Generate self-signed SSL cert using bundled cryptography."""
-    if not HAS_CRYPTO:
-        return False, "cryptography library not bundled"
+    """Generate self-signed SSL cert using bundled cryptography or WSL fallback."""
+    # Attempt 1: Native Python (if bundled)
+    if HAS_CRYPTO:
+        try:
+            ok, msg = _do_gen_cert(ip, cert_path, key_path)
+            if ok: return True, "native"
+        except Exception as e:
+            pass # Try fallback
     
-    try:
-        return _do_gen_cert(ip, cert_path, key_path)
-    except Exception as e:
-        return False, str(e)
+    # Attempt 2: WSL OpenSSL Fallback (100% reliable as long as WSL is up)
+    if IS_WINDOWS:
+        return gen_ssl_cert_wsl(ip, cert_path, key_path)
+    
+    return False, "cryptography library not bundled"
+
+def gen_ssl_cert_wsl(ip, cert_path, key_path):
+    """Generate SSL cert using openssl inside WSL."""
+    self_dir = to_wsl_path(cert_path.parent)
+    c_name = cert_path.name
+    k_name = key_path.name
+    
+    # Simple openssl command for self-signed cert
+    cmd = (
+        f"mkdir -p {self_dir} && "
+        f"openssl req -x509 -nodes -days 3650 -newkey rsa:2048 "
+        f"-keyout {self_dir}/{k_name} -out {self_dir}/{c_name} "
+        f"-subj \"/CN={ip}/O=Nextcloud LAN/C=DZ\" "
+        f"-addext \"subjectAltName = DNS:localhost, IP:{ip}, IP:127.0.0.1\""
+    )
+    
+    code, out, err = run_universal_cmd(cmd, timeout=30)
+    if code == 0:
+        return True, "wsl-openssl"
+    return False, f"OpenSSL fallback failed: {err or out}"
 
 def _do_gen_cert(ip, cert_path, key_path):
     from cryptography import x509
