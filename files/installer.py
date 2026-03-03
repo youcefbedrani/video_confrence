@@ -1683,7 +1683,15 @@ class App(tk.Tk):
         if IS_WINDOWS:
             self._log("  Syncing to native Linux storage...", "dim")
             wsl_src = to_wsl_path(INSTALL_DIR)
-            run_cmd(f'wsl -u root bash -c "mkdir -p {WSL_NATIVE_DIR} && cp -r {wsl_src}/* {WSL_NATIVE_DIR}/"')
+            # Use -RT for clean recursive copy and -L to follow symlinks if any
+            # Then force permissions to 755 so Docker can read everything
+            sync_cmd = (
+                f"rm -rf {WSL_NATIVE_DIR} && "
+                f"mkdir -p {WSL_NATIVE_DIR} && "
+                f"cp -RT \"{wsl_src}/\" {WSL_NATIVE_DIR}/ && "
+                f"chmod -R 755 {WSL_NATIVE_DIR}"
+            )
+            run_cmd(f'wsl -u root bash -c "{sync_cmd}"')
             self._log("  ✅  Linux storage synchronized", "ok")
 
         self._log("  📁  " + str(INSTALL_DIR), "dim")
@@ -1727,6 +1735,14 @@ class App(tk.Tk):
 
         wsl_dir = WSL_NATIVE_DIR if IS_WINDOWS else to_wsl_path(INSTALL_DIR)
         
+        # Pre-flight check: Verify files actually exists in WSL native FS
+        if IS_WINDOWS:
+            code, out, _ = run_universal_cmd(f"ls -R {WSL_NATIVE_DIR}/nginx", timeout=10)
+            if "nextcloud.crt" not in out:
+                self._log("  ❌  Crucial files missing in Linux storage!", "error")
+                self._log(f"  Debug output: {out[:100]}", "dim")
+                return False
+
         # Cleanup any old ones
         run_universal_cmd(f"cd {wsl_dir} && docker compose down -v > /dev/null 2>&1")
         run_universal_cmd("docker rm -f nextcloud-nginx nextcloud-app nextcloud-db nextcloud-redis > /dev/null 2>&1")
