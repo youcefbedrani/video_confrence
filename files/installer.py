@@ -1737,10 +1737,10 @@ class App(tk.Tk):
                 # Clear old ones first to prevent conflicts
                 run_cmd(f'netsh interface portproxy reset')
                 
-                # Add proxy for HTTPS
-                run_cmd(f'netsh interface portproxy add v4tov4 listenport={s_port} connectport=443 connectaddress={wsl_ip}')
-                # Add proxy for HTTP (redirects)
-                run_cmd(f'netsh interface portproxy add v4tov4 listenport={h_port} connectport=80 connectaddress={wsl_ip}')
+                # Add proxy for HTTPS (Map Host:Port -> WSL:Port)
+                run_cmd(f'netsh interface portproxy add v4tov4 listenport={s_port} connectport={s_port} connectaddress={wsl_ip}')
+                # Add proxy for HTTP (Map Host:Port -> WSL:Port)
+                run_cmd(f'netsh interface portproxy add v4tov4 listenport={h_port} connectport={h_port} connectaddress={wsl_ip}')
                 
                 # Firewall rules (Netsh)
                 run_cmd(f'netsh advfirewall firewall delete rule name="Nextcloud-HTTPS" >nul 2>&1')
@@ -1771,19 +1771,35 @@ class App(tk.Tk):
 
         # Wait for HTTP response - HARDENED HEALTH CHECK
         self._log(f"\n  Checking site health (https://{ip}:{https_port})...", "dim")
-        url = f"https://{ip}:{https_port}"
+        
         ctx = ssl_module.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode    = ssl_module.CERT_NONE
 
         responding = False
+        # Try LOCALHOST first (isolation check)
+        self._log("  Testing Localhost loopback...", "dim")
+        for i in range(10):
+            try:
+                with urllib.request.urlopen(f"https://127.0.0.1:{https_port}", context=ctx, timeout=3) as r:
+                    if r.status in (200, 302, 502, 503):
+                        self._log("  ✅  Internal bridge responding", "dim")
+                        break
+            except Exception: pass
+            time.sleep(2)
+
+        # Full check
+        url = f"https://{ip}:{https_port}"
+        self._log(f"  Testing LAN address: {url}", "dim")
         for i in range(50): # 250 seconds max
             if self.abort_flag: return False
             self._sprog(int((i+1)*100/50), f"Waiting for Web... { (i+1)*5 }s")
             try:
                 # Use a very short timeout for the attempt
                 with urllib.request.urlopen(url, context=ctx, timeout=3) as r:
-                    if r.status in (200, 302):
+                    # Accept 502 (Bad Gateway) or 503 as "alive" because Nginx is up 
+                    # but the app container might still be starting php-fpm
+                    if r.status in (200, 302, 403, 502, 503):
                         self._log("  ✅  Nextcloud is responding!", "ok")
                         responding = True
                         break
