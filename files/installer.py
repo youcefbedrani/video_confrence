@@ -664,9 +664,10 @@ def write_nginx_conf(install_dir):
         "    worker_connections 1024;\n"
         "}\n\n"
         "http {\n"
-        "    upstream nextcloud {\n"
-        "        server app:80;\n"
-        "    }\n\n"
+        "    include       mime.types;\n"
+        "    default_type  application/octet-stream;\n\n"
+        "    # Use Docker DNS for dynamic resolution (avoids 502 on container IP change)\n"
+        "    resolver 127.0.0.11 valid=5s;\n\n"
         "    server {\n"
         "        listen 80;\n"
         "        server_name _;\n"
@@ -687,18 +688,19 @@ def write_nginx_conf(install_dir):
         "        add_header X-Content-Type-Options nosniff always;\n"
         "        add_header X-Frame-Options SAMEORIGIN always;\n\n"
         "        location / {\n"
-        "            proxy_pass         http://nextcloud;\n"
+        "            set $upstream_app app;\n"
+        "            proxy_pass         http://$upstream_app:80;\n"
         "            proxy_set_header   Host $host;\n"
         "            proxy_set_header   X-Real-IP $remote_addr;\n"
-        "            proxy_set_header   X-Forwarded-For "
-        "$proxy_add_x_forwarded_for;\n"
+        "            proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;\n"
         "            proxy_set_header   X-Forwarded-Proto https;\n"
         "            proxy_set_header   X-Forwarded-Host $host;\n"
         "            proxy_buffering    off;\n"
         "            proxy_request_buffering off;\n"
         "        }\n\n"
         "        location /push/ {\n"
-        "            proxy_pass         http://nextcloud;\n"
+        "            set $upstream_app app;\n"
+        "            proxy_pass         http://$upstream_app:80;\n"
         "            proxy_http_version 1.1;\n"
         "            proxy_set_header   Upgrade $http_upgrade;\n"
         "            proxy_set_header   Connection upgrade;\n"
@@ -1704,15 +1706,25 @@ class App(tk.Tk):
         if IS_WINDOWS:
             self._log("  Syncing to native Linux storage...", "dim")
             wsl_src = to_wsl_path(INSTALL_DIR)
-            # Use -RT for clean recursive copy and -L to follow symlinks if any
-            # Then force permissions to 755 so Docker can read everything
+            
+            # Verifier: Ensure source actually exists and has files
+            if not INSTALL_DIR.exists() or not (INSTALL_DIR / "nginx").exists():
+                self._log("  ❌ Error: Source directory C:/Nextcloud-LAN is incomplete.", "error")
+                return False
+
+            # Use run_universal_cmd to handle escaping correctly
+            # set -e ensures we stop on the first error
             sync_cmd = (
+                f"set -e && "
                 f"rm -rf {WSL_NATIVE_DIR} && "
                 f"mkdir -p {WSL_NATIVE_DIR} && "
                 f"cp -RT \"{wsl_src}/\" {WSL_NATIVE_DIR}/ && "
-                f"chmod -R 755 {WSL_NATIVE_DIR}"
+                f"chmod -R 777 {WSL_NATIVE_DIR}" # Grant full perms for initial setup
             )
-            run_cmd(f'wsl -u root bash -c "{sync_cmd}"')
+            code, out, err = run_universal_cmd(sync_cmd, timeout=120)
+            if code != 0:
+                self._log(f"  ❌  Sync failed inside WSL: {err or out}", "error")
+                return False
             self._log("  ✅  Linux storage synchronized", "ok")
 
         self._log("  📁  " + str(INSTALL_DIR), "dim")
@@ -1857,10 +1869,10 @@ class App(tk.Tk):
         req = urllib.request.Request(url, headers={'User-Agent': 'Nextcloud-Installer/3.0'})
         self._log(f"  Testing LAN address: {url}", "dim")
         
-        # Platinum Wait: 120 attempts x 5s = 10 Minutes (crucial for slow first-runs)
-        for i in range(120): 
+        # Platinum Wait Hardened: 180 attempts x 5s = 15 Minutes (Some HDDs are very slow on first init)
+        for i in range(180): 
             if self.abort_flag: return False
-            self._sprog(int((i+1)*100/120), f"Waiting for Site... { (i+1)*5 }s")
+            self._sprog(int((i+1)*100/180), f"Waiting for Site... { (i+1)*5 }s")
             
             try:
                 # Use a dummy context to ignore self-signed cert errors
@@ -1870,17 +1882,16 @@ class App(tk.Tk):
                 
                 with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
                     status = r.getcode()
-                    # 200 (OK), 302 (Redirect) are the goals
                     if status in [200, 301, 302]: 
                         responding = True
                         self._log("  ✅  Nextcloud App is Responsive!", "ok")
                         break
                     else:
-                        self._log(f"  (HTTP {status} - site is up, waiting for app...)", "dim")
+                        if i % 4 == 0: self._log(f"  (HTTP {status} - site is up, waiting for app...)", "dim")
             except urllib.error.HTTPError as he:
                 # 502/503 means NGINX is alive but PHP is still starting - Keep Waiting!
                 if he.code in [502, 503]:
-                    if i % 4 == 0: self._log("  ... Nginx is alive, waiting for PHP-FPM ...", "dim")
+                    if i % 6 == 0: self._log("  ... Nginx is alive, waiting for Nextcloud engine ...", "dim")
                 else:
                     self._log(f"  (HTTP {he.code} - waiting...)", "dim")
             except Exception:
@@ -1894,15 +1905,16 @@ class App(tk.Tk):
             self._log("\n─── Platinum Diagnostics ─────────────────", "warn")
             wsl_dir = WSL_NATIVE_DIR if IS_WINDOWS else to_wsl_path(INSTALL_DIR)
             
-            # Deep Scan 1: Check if files are physically present and readable
-            _, scan, _ = run_universal_cmd(f"ls -laR {WSL_NATIVE_DIR}/nginx", timeout=10)
-            self._log("  Filesystem Scan:\n" + scan, "dim")
+            # Deep Scan 1: Check if files are physically present (Use root for accurate scan)
+            distro = get_wsl_distro()
+            _, scan, _ = run_cmd(f"wsl -d {distro} -u root ls -laR {WSL_NATIVE_DIR}/nginx", timeout=10)
+            self._log("  Filesystem Scan (Native Storage):\n" + (scan if scan.strip() else "  (EMPTY - Sync failed!)"), "dim")
             
             # Deep Scan 2: Container Logs
             _, logs, _ = run_universal_cmd(f"cd {wsl_dir} && docker compose logs --tail=50", timeout=30)
             self._log("\n  Container Logs:\n" + (logs if logs.strip() else "  (None)"), "dim")
             
-            self._log("\nHINT: If 'ls' above is empty, your WSL storage failed to sync.", "warn")
+            self._log("\nHINT: If 'Sync failed' or 'EMPTY' appears above, your Windows files are not reachable by WSL.", "warn")
             return False
 
         self._mprog(90)
