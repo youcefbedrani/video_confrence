@@ -59,6 +59,7 @@ except ImportError:
 
 APP_VERSION = "3.0"
 INSTALL_DIR = Path("C:/Nextcloud-LAN") if IS_WINDOWS else Path.home() / "Nextcloud-LAN"
+WSL_NATIVE_DIR = "/opt/nextcloud-lan" # Absolute path inside WSL
 
 # Docker Engine for Windows (no Desktop, no login required)
 # This is the official Docker Engine MSI — silent install
@@ -1677,6 +1678,14 @@ class App(tk.Tk):
         self._log("  ✅  docker-compose.yml", "ok")
         write_nginx_conf(INSTALL_DIR)
         self._log("  ✅  nginx/nginx.conf", "ok")
+
+        # Sync to Native WSL for 100% reliability (Mounting /mnt/c is flaky)
+        if IS_WINDOWS:
+            self._log("  Syncing to native Linux storage...", "dim")
+            wsl_src = to_wsl_path(INSTALL_DIR)
+            run_cmd(f'wsl -u root bash -c "mkdir -p {WSL_NATIVE_DIR} && cp -r {wsl_src}/* {WSL_NATIVE_DIR}/"')
+            self._log("  ✅  Linux storage synchronized", "ok")
+
         self._log("  📁  " + str(INSTALL_DIR), "dim")
         self._mprog(52)
 
@@ -1685,7 +1694,7 @@ class App(tk.Tk):
         self._status("Downloading Linux images (~500 MB)...")
         self._log("  This may take 5–15 minutes...", "warn")
         
-        wsl_dir = to_wsl_path(INSTALL_DIR)
+        wsl_dir = WSL_NATIVE_DIR if IS_WINDOWS else to_wsl_path(INSTALL_DIR)
         cmd = f'cd {wsl_dir} && docker compose pull'
         
         # Pull with retry logic for network/DNS issues
@@ -1702,7 +1711,7 @@ class App(tk.Tk):
             
             # If we are here, it failed. Try DNS fix on first failure.
             if attempt == 0:
-                self._log("  ⚠  Download interrupted. Applying DNS rescue...", "warn")
+                self._log("  ⚠  Download issues detecting. Applying DNS rescue...", "warn")
                 run_universal_cmd('echo "nameserver 8.8.8.8" > /etc/resolv.conf', timeout=10)
                 time.sleep(2)
                 self._log("  Retrying download...", "dim")
@@ -1716,9 +1725,10 @@ class App(tk.Tk):
         self._log("\n─── Starting Nextcloud ───────────────────", "info")
         self._status("Starting containers in WSL...")
 
-        wsl_dir = to_wsl_path(INSTALL_DIR)
+        wsl_dir = WSL_NATIVE_DIR if IS_WINDOWS else to_wsl_path(INSTALL_DIR)
         
         # Cleanup any old ones
+        run_universal_cmd(f"cd {wsl_dir} && docker compose down -v > /dev/null 2>&1")
         run_universal_cmd("docker rm -f nextcloud-nginx nextcloud-app nextcloud-db nextcloud-redis > /dev/null 2>&1")
 
         # Start
@@ -1774,9 +1784,7 @@ class App(tk.Tk):
             # Register auto-start on boot
             self._log("  Registering auto-start on boot...", "dim")
             distro = get_wsl_distro()
-            # More robust relaunch with portproxy persistence would need a scheduled task 
-            # that runs a script, but for now we keep it simple.
-            wsl_launch = f"service docker start && cd {wsl_dir} && docker compose up -d"
+            wsl_launch = f"service docker start && cd {WSL_NATIVE_DIR} && docker compose up -d"
             safe_launch = wsl_launch.replace('"', '\\"')
             wsl_up_cmd = f'wsl -d {distro} -u root bash -c "{safe_launch}"'
             
@@ -1830,7 +1838,7 @@ class App(tk.Tk):
             self._log("  ❌  Nextcloud failed to respond.", "error")
             self._log("\n─── Container Diagnostics ────────────────", "warn")
             # Dump last 50 lines of logs for debugging
-            wsl_dir = to_wsl_path(INSTALL_DIR)
+            wsl_dir = WSL_NATIVE_DIR if IS_WINDOWS else to_wsl_path(INSTALL_DIR)
             _, logs, _ = run_universal_cmd(f"cd {wsl_dir} && docker compose logs --tail=50", timeout=30)
             self._log(logs if logs.strip() else "  (No container logs found)", "dim")
             
@@ -1845,6 +1853,7 @@ class App(tk.Tk):
         self._log("\n─── Nextcloud Auto-Config ────────────────", "info")
         self._status("Automating setup inside WSL...")
 
+        wsl_dir = WSL_NATIVE_DIR if IS_WINDOWS else to_wsl_path(INSTALL_DIR)
         admin_user = "admin"
         admin_pass = "nextcloud-admin"
 
