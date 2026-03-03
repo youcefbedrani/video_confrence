@@ -28,6 +28,7 @@ import ctypes
 import tempfile
 import shutil
 import urllib.request
+import urllib.error
 import ssl as ssl_module
 import ipaddress
 import datetime
@@ -293,20 +294,23 @@ def is_docker_running():
     return code == 0
 
 def gen_ssl_cert(ip, cert_path, key_path):
-    """Generate self-signed SSL cert using bundled cryptography or WSL fallback."""
-    # Attempt 1: Native Python (if bundled)
+    """
+    Generate self-signed SSL cert.
+    Priority: WSL OpenSSL (most reliable) > Python Cryptography (bundling fallback).
+    """
+    # 1. Try WSL OpenSSL first if on Windows (100% reliable as long as WSL is up)
+    if IS_WINDOWS:
+        ok, msg = gen_ssl_cert_wsl(ip, cert_path, key_path)
+        if ok: return True, "wsl-openssl"
+
+    # 2. Try Python Cryptography if bundled
     if HAS_CRYPTO:
         try:
-            ok, msg = _do_gen_cert(ip, cert_path, key_path)
-            if ok: return True, "native"
+            return _do_gen_cert(ip, cert_path, key_path)
         except Exception as e:
-            pass # Try fallback
+            pass
     
-    # Attempt 2: WSL OpenSSL Fallback (100% reliable as long as WSL is up)
-    if IS_WINDOWS:
-        return gen_ssl_cert_wsl(ip, cert_path, key_path)
-    
-    return False, "cryptography library not bundled"
+    return False, "cryptography library not bundled and WSL openssl failed"
 
 def gen_ssl_cert_wsl(ip, cert_path, key_path):
     """Generate SSL cert using openssl inside WSL."""
@@ -1396,7 +1400,12 @@ class App(tk.Tk):
             # Step 3 — SSL Certificate
             self._set_step(3)
             self._mprog(38)
-            self._do_ssl(ip)
+            self._do_ssl_cert(ip)
+            # Verify SSL exists - Mandatory!
+            ssl_file = INSTALL_DIR / "nginx" / "ssl" / "nextcloud.crt"
+            if not ssl_file.exists():
+                self._alert("SSL Error", "Failed to generate security certificate. Nginx cannot start.")
+                return
             if self.abort_flag: return
 
             # Step 4 — Config files
@@ -1427,7 +1436,6 @@ class App(tk.Tk):
 
             # Step 8 — Done
             self._set_step(8)
-            self._mprog(100)
             self._mprog(100)
             self._sprog(100)
 
@@ -1675,7 +1683,7 @@ class App(tk.Tk):
         self._log("  ❌  Docker failed to start within 45 seconds.", "error")
         return False
 
-    def _do_ssl(self, ip):
+    def _do_ssl_cert(self, ip): # Renamed from _do_ssl
         self._log("─── SSL Certificate ──────────────────────", "info")
         self._status("Generating SSL certificate...")
         self._sprog(0, "Generating certificate...")
@@ -1859,22 +1867,35 @@ class App(tk.Tk):
 
         # Full check
         url = f"https://{ip}:{https_port}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}) # Added User-Agent
         self._log(f"  Testing LAN address: {url}", "dim")
         for i in range(50): # 250 seconds max
             if self.abort_flag: return False
             self._sprog(int((i+1)*100/50), f"Waiting for Web... { (i+1)*5 }s")
             try:
-                # Use a very short timeout for the attempt
-                with urllib.request.urlopen(url, context=ctx, timeout=3) as r:
-                    # Accept 502 (Bad Gateway) or 503 as "alive" because Nginx is up 
-                    # but the app container might still be starting php-fpm
-                    if r.status in (200, 302, 403, 502, 503):
-                        self._log("  ✅  Nextcloud is responding!", "ok")
+                # Use a dummy context to ignore self-signed cert errors
+                ctx = ssl_module.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl_module.CERT_NONE
+                
+                with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                    status = r.getcode()
+                    if status in [200, 301, 302, 403, 404]: 
                         responding = True
                         break
-            except Exception:
+            except urllib.error.HTTPError as he:
+                # Accept 502/503 as "alive" - Nginx is up but app is warming up
+                if he.code in [502, 503]:
+                    self._log(f"  (Nginx alive, waiting for app...)", "dim")
+                    responding = True
+                    break
+                else:
+                    self._log(f"  (HTTP {he.code}, retrying...)", "dim")
+            except Exception as e:
+                # Other errors (Connection Refused, etc)
                 pass
-            time.sleep(5)
+            
+            time.sleep(4)
         
         if not responding:
             self._log("  ❌  Nextcloud failed to respond.", "error")
@@ -1899,8 +1920,17 @@ class App(tk.Tk):
         admin_user = "admin"
         admin_pass = "nextcloud-admin"
 
+        # Hardness: Wait for app container to be ready for OCC
+        self._log("  Waiting for PHP-FPM internal readiness...", "dim")
+        for i in range(12): # Wait up to 60s
+            code, out, _ = run_universal_cmd(f"cd {wsl_dir} && docker compose exec -u www-data app php occ status", timeout=10)
+            if "installed: false" in out or "installed: true" in out:
+                self._log("  ✅  App engine ready", "ok")
+                break
+            time.sleep(5)
+
         # Check if already installed
-        code, out, _ = run_universal_cmd("docker exec --user www-data nextcloud-app php occ status")
+        code, out, _ = run_universal_cmd(f"cd {wsl_dir} && docker compose exec -u www-data app php occ status", timeout=30)
         if "installed: true" in out:
             self._log("  ✅  Nextcloud already initialized", "ok")
             return
