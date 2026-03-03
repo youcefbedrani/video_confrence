@@ -1714,10 +1714,44 @@ class App(tk.Tk):
 
         self._log("  ✅  Containers are running", "ok")
 
-        # Register auto-start on boot
+        # LAN Connectivity: WSL2 Port Proxy
         if IS_WINDOWS:
+            self._status("Configuring LAN access...")
+            self._log("  Setting up network bridge/proxy...", "dim")
+            
+            # Find the internal WSL IP (eth0)
+            code, wsl_ip, _ = run_cmd("wsl -u root hostname -I")
+            wsl_ip = wsl_ip.split()[0] if wsl_ip.strip() else ""
+            
+            if wsl_ip:
+                self._log(f"  Internal bridge: {wsl_ip}", "dim")
+                h_port = self.http_port.get()
+                s_port = https_port # Already a string
+                
+                # NETSH Port Proxy: Forward Host IP -> WSL IP
+                # Clear old ones first to prevent conflicts
+                run_cmd(f'netsh interface portproxy reset')
+                
+                # Add proxy for HTTPS
+                run_cmd(f'netsh interface portproxy add v4tov4 listenport={s_port} connectport=443 connectaddress={wsl_ip}')
+                # Add proxy for HTTP (redirects)
+                run_cmd(f'netsh interface portproxy add v4tov4 listenport={h_port} connectport=80 connectaddress={wsl_ip}')
+                
+                # Firewall rules (Netsh)
+                run_cmd(f'netsh advfirewall firewall delete rule name="Nextcloud-HTTPS" >nul 2>&1')
+                run_cmd(f'netsh advfirewall firewall add rule name="Nextcloud-HTTPS" protocol=TCP dir=in localport={s_port} action=allow')
+                run_cmd(f'netsh advfirewall firewall delete rule name="Nextcloud-HTTP" >nul 2>&1')
+                run_cmd(f'netsh advfirewall firewall add rule name="Nextcloud-HTTP" protocol=TCP dir=in localport={h_port} action=allow')
+                
+                self._log("  ✅  LAN Port Proxy active", "ok")
+            else:
+                self._log("  ⚠  Could not detect WSL IP — LAN access may fail", "warn")
+
+            # Register auto-start on boot
             self._log("  Registering auto-start on boot...", "dim")
             distro = get_wsl_distro()
+            # More robust relaunch with portproxy persistence would need a scheduled task 
+            # that runs a script, but for now we keep it simple.
             wsl_launch = f"service docker start && cd {wsl_dir} && docker compose up -d"
             safe_launch = wsl_launch.replace('"', '\\"')
             wsl_up_cmd = f'wsl -d {distro} -u root bash -c "{safe_launch}"'
@@ -1727,30 +1761,36 @@ class App(tk.Tk):
             )
             self._log("  ✅  Auto-start registered", "ok")
 
-            # Firewall rule
-            run_cmd(f'netsh advfirewall firewall add rule name="Nextcloud" protocol=TCP dir=in localport={https_port} action=allow')
         else:
             self._log("  (Skipping Windows auto-start/firewall on Linux)", "dim")
 
-        # Wait for HTTP response
-        self._log("\n  Waiting for Nextcloud to respond...", "dim")
+        # Wait for HTTP response - HARDENED HEALTH CHECK
+        self._log("\n  Checking site health (https://{ip}:{https_port})...", "dim")
         url = f"https://{ip}:{https_port}"
         ctx = ssl_module.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode    = ssl_module.CERT_NONE
 
-        for i in range(40):
+        responding = False
+        for i in range(50): # 250 seconds max
             if self.abort_flag: return False
-            time.sleep(5)
-            self._sprog(int((i+1)*100/40), f"Waiting for Web... { (i+1)*5 }s")
+            self._sprog(int((i+1)*100/50), f"Waiting for Web... { (i+1)*5 }s")
             try:
-                r = urllib.request.urlopen(url, context=ctx, timeout=5)
-                if r.status in (200, 302):
-                    self._log("  ✅  Nextcloud is responding!", "ok")
-                    break
+                # Use a very short timeout for the attempt
+                with urllib.request.urlopen(url, context=ctx, timeout=3) as r:
+                    if r.status in (200, 302):
+                        self._log("  ✅  Nextcloud is responding!", "ok")
+                        responding = True
+                        break
             except Exception:
                 pass
+            time.sleep(5)
         
+        if not responding:
+            self._log("  ❌  Nextcloud failed to respond. Check Docker logs.", "error")
+            self._status("Health check failed — site unreachable")
+            return False
+
         self._mprog(90)
         return True
 
