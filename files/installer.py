@@ -125,15 +125,19 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
 
-    # If it's a Path object, use it directly, else wrap it
+    # Prioritize bundled path
     target = Path(base_path) / relative_path
-    if not target.exists():
-        # Last resort fallback to current directory
-        alt_target = Path(os.getcwd()) / relative_path
-        if alt_target.exists():
-            return alt_target
-            
-    return target
+    if target.exists():
+        return target
+        
+    # fallback to alongside the exe/script
+    side_path = Path(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)) / relative_path
+    if side_path.exists():
+        return side_path
+        
+    # Last resort fallback to current directory
+    alt_target = Path(os.getcwd()) / relative_path
+    return alt_target
 
 def to_wsl_path(win_path):
     """Convert a Windows path like C:\\Foo to /mnt/c/Foo."""
@@ -184,11 +188,23 @@ def run_cmd(cmd, timeout=300):
             timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW
         )
-        return (
-            r.returncode,
-            r.stdout.decode("utf-8", errors="ignore"),
-            r.stderr.decode("utf-8", errors="ignore"),
-        )
+        stdout = r.stdout
+        stderr = r.stderr
+        
+        # WSL commands on Windows often output in UTF-16
+        def decode_safe(data):
+            if not data: return ""
+            # Try UTF-8 first
+            try:
+                return data.decode("utf-8").replace('\x00', '')
+            except UnicodeDecodeError:
+                # Try UTF-16
+                try:
+                    return data.decode("utf-16").replace('\x00', '')
+                except:
+                    return data.decode("utf-8", errors="ignore").replace('\x00', '')
+
+        return (r.returncode, decode_safe(stdout), decode_safe(stderr))
     except subprocess.TimeoutExpired:
         return -1, "", "Timeout"
     except Exception as e:
@@ -218,10 +234,18 @@ def get_wsl_distro():
     """Detects the installed Ubuntu distro name on Windows."""
     if not IS_WINDOWS: return "linux"
     code, out, _ = run_cmd("wsl -l -v")
-    if code != 0: return "Ubuntu"
+    if code != 0 or not out: return "Ubuntu"
+    
+    # Process output line by line, looking for Ubuntu
+    # Handle cases where multiple Ubuntu distros exist
     for line in out.splitlines():
+        if not line.strip(): continue
         if "Ubuntu" in line:
-            return line.split()[0].replace("*", "").strip()
+            parts = line.split()
+            # If the first part is '*', the name is the second part
+            if parts[0] == '*':
+                return parts[1].strip()
+            return parts[0].strip()
     return "Ubuntu"
 
 def is_docker_engine_installed():
@@ -1529,6 +1553,8 @@ class App(tk.Tk):
                         stdout, stderr = process.communicate()
                         if ret == 0:
                             self._log("  ✅  Distro installation command finished", "ok")
+                        elif "0x4294967295" in (stderr + stdout) or "already exists" in (stderr + stdout).lower():
+                            self._log("  ✅  Ubuntu already exists, skipping install", "ok")
                         else:
                             # Detect specific network error 0x80072efe
                             if "0x80072efe" in (stderr + stdout):
