@@ -119,7 +119,6 @@ def get_local_ip():
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         if hasattr(sys, '_MEIPASS'):
             base_path = sys._MEIPASS
         else:
@@ -127,19 +126,7 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
 
-    # Prioritize bundled path
-    target = Path(base_path) / relative_path
-    if target.exists():
-        return target
-        
-    # fallback to alongside the exe/script
-    side_path = Path(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)) / relative_path
-    if side_path.exists():
-        return side_path
-        
-    # Last resort fallback to current directory
-    alt_target = Path(os.getcwd()) / relative_path
-    return alt_target
+    return str(Path(base_path) / relative_path)
 
 def to_wsl_path(win_path):
     """Convert a Windows path like C:\\Foo to /mnt/c/Foo."""
@@ -1867,11 +1854,14 @@ class App(tk.Tk):
 
         # Full check
         url = f"https://{ip}:{https_port}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}) # Added User-Agent
+        req = urllib.request.Request(url, headers={'User-Agent': 'Nextcloud-Installer/3.0'})
         self._log(f"  Testing LAN address: {url}", "dim")
-        for i in range(50): # 250 seconds max
+        
+        # Platinum Wait: 120 attempts x 5s = 10 Minutes (crucial for slow first-runs)
+        for i in range(120): 
             if self.abort_flag: return False
-            self._sprog(int((i+1)*100/50), f"Waiting for Web... { (i+1)*5 }s")
+            self._sprog(int((i+1)*100/120), f"Waiting for Site... { (i+1)*5 }s")
+            
             try:
                 # Use a dummy context to ignore self-signed cert errors
                 ctx = ssl_module.create_default_context()
@@ -1880,33 +1870,39 @@ class App(tk.Tk):
                 
                 with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
                     status = r.getcode()
-                    if status in [200, 301, 302, 403, 404]: 
+                    # 200 (OK), 302 (Redirect) are the goals
+                    if status in [200, 301, 302]: 
                         responding = True
+                        self._log("  ✅  Nextcloud App is Responsive!", "ok")
                         break
+                    else:
+                        self._log(f"  (HTTP {status} - site is up, waiting for app...)", "dim")
             except urllib.error.HTTPError as he:
-                # Accept 502/503 as "alive" - Nginx is up but app is warming up
+                # 502/503 means NGINX is alive but PHP is still starting - Keep Waiting!
                 if he.code in [502, 503]:
-                    self._log(f"  (Nginx alive, waiting for app...)", "dim")
-                    responding = True
-                    break
+                    if i % 4 == 0: self._log("  ... Nginx is alive, waiting for PHP-FPM ...", "dim")
                 else:
-                    self._log(f"  (HTTP {he.code}, retrying...)", "dim")
-            except Exception as e:
-                # Other errors (Connection Refused, etc)
+                    self._log(f"  (HTTP {he.code} - waiting...)", "dim")
+            except Exception:
+                # Connection refused etc - Container still booting
                 pass
             
-            time.sleep(4)
+            time.sleep(5)
         
         if not responding:
             self._log("  ❌  Nextcloud failed to respond.", "error")
-            self._log("\n─── Container Diagnostics ────────────────", "warn")
-            # Dump last 50 lines of logs for debugging
+            self._log("\n─── Platinum Diagnostics ─────────────────", "warn")
             wsl_dir = WSL_NATIVE_DIR if IS_WINDOWS else to_wsl_path(INSTALL_DIR)
-            _, logs, _ = run_universal_cmd(f"cd {wsl_dir} && docker compose logs --tail=50", timeout=30)
-            self._log(logs if logs.strip() else "  (No container logs found)", "dim")
             
-            self._log("\n  HINT: The log above shows why it failed. Usually it is a partial download or memory issue.", "warn")
-            self._status("Health check failed — see logs")
+            # Deep Scan 1: Check if files are physically present and readable
+            _, scan, _ = run_universal_cmd(f"ls -laR {WSL_NATIVE_DIR}/nginx", timeout=10)
+            self._log("  Filesystem Scan:\n" + scan, "dim")
+            
+            # Deep Scan 2: Container Logs
+            _, logs, _ = run_universal_cmd(f"cd {wsl_dir} && docker compose logs --tail=50", timeout=30)
+            self._log("\n  Container Logs:\n" + (logs if logs.strip() else "  (None)"), "dim")
+            
+            self._log("\nHINT: If 'ls' above is empty, your WSL storage failed to sync.", "warn")
             return False
 
         self._mprog(90)
