@@ -1687,18 +1687,30 @@ class App(tk.Tk):
         
         wsl_dir = to_wsl_path(INSTALL_DIR)
         cmd = f'cd {wsl_dir} && docker compose pull'
-        code, out, err = run_universal_cmd(cmd, timeout=1800)
         
-        if code == 0:
-            self._log("  ✅  All images downloaded", "ok")
-            self._sprog(100)
-            self._mprog(78)
-            return True
-        else:
-            self._log("  ❌  Pull failed!", "error")
-            self._log(f"  Error: {err[:300] if err else out[:300]}", "error")
-            self._log("  Check internet and try: wsl --shutdown", "warn")
-            return False
+        # Pull with retry logic for network/DNS issues
+        for attempt in range(2):
+            code, out, err = run_universal_cmd(cmd, timeout=1800)
+            combined = (out + "\n" + err).lower()
+            
+            # Strict check: Even if code is 0, check for "error" in text (e.g. partial pull failure)
+            if code == 0 and "error" not in combined and "failed" not in combined:
+                self._log("  ✅  All images downloaded", "ok")
+                self._sprog(100)
+                self._mprog(78)
+                return True
+            
+            # If we are here, it failed. Try DNS fix on first failure.
+            if attempt == 0:
+                self._log("  ⚠  Download interrupted. Applying DNS rescue...", "warn")
+                run_universal_cmd('echo "nameserver 8.8.8.8" > /etc/resolv.conf', timeout=10)
+                time.sleep(2)
+                self._log("  Retrying download...", "dim")
+            else:
+                self._log("  ❌  Pull failed permanently!", "error")
+                self._log(f"  Diagnostic: {err[:300] if err else out[:300]}", "error")
+                return False
+        return False
 
     def _do_start(self, ip, https_port):
         self._log("\n─── Starting Nextcloud ───────────────────", "info")
@@ -1742,6 +1754,13 @@ class App(tk.Tk):
                 # Add proxy for HTTP (Map Host:Port -> WSL:Port)
                 run_cmd(f'netsh interface portproxy add v4tov4 listenport={h_port} connectport={h_port} connectaddress={wsl_ip}')
                 
+                # Verification
+                _, v_out, _ = run_cmd("netsh interface portproxy show all")
+                if wsl_ip in v_out:
+                    self._log("  ✅  LAN Port Proxy active & verified", "ok")
+                else:
+                    self._log("  ⚠  Port Proxy not appearing in Windows list!", "warn")
+
                 # Firewall rules (Netsh)
                 run_cmd(f'netsh advfirewall firewall delete rule name="Nextcloud-HTTPS" >nul 2>&1')
                 run_cmd(f'netsh advfirewall firewall add rule name="Nextcloud-HTTPS" protocol=TCP dir=in localport={s_port} action=allow')
@@ -1808,10 +1827,15 @@ class App(tk.Tk):
             time.sleep(5)
         
         if not responding:
-            self._log("  ❌  Nextcloud failed to respond. Check Docker logs.", "error")
-            self._log("      HINT: Ensure no other web server is on port 8443.", "warn")
-            self._log("      HINT: Check if Docker is running in WSL (wsl --list -v).", "warn")
-            self._status("Health check failed — site unreachable")
+            self._log("  ❌  Nextcloud failed to respond.", "error")
+            self._log("\n─── Container Diagnostics ────────────────", "warn")
+            # Dump last 50 lines of logs for debugging
+            wsl_dir = to_wsl_path(INSTALL_DIR)
+            _, logs, _ = run_universal_cmd(f"cd {wsl_dir} && docker compose logs --tail=50", timeout=30)
+            self._log(logs if logs.strip() else "  (No container logs found)", "dim")
+            
+            self._log("\n  HINT: The log above shows why it failed. Usually it is a partial download or memory issue.", "warn")
+            self._status("Health check failed — see logs")
             return False
 
         self._mprog(90)
