@@ -1381,7 +1381,9 @@ class App(tk.Tk):
             # Step 5 — Pull images
             self._set_step(5)
             self._mprog(55)
-            self._do_pull()
+            if not self._do_pull():
+                self._alert("Download Error", "Failed to download Docker images. Check your internet connection and try again.")
+                return
             if self.abort_flag: return
 
             # Step 6 — Start services
@@ -1678,7 +1680,7 @@ class App(tk.Tk):
         self._log("  📁  " + str(INSTALL_DIR), "dim")
         self._mprog(52)
 
-    def _do_pull(self):
+    def _do_pull(self) -> bool:
         self._log("\n─── Pulling Docker Images ────────────────", "info")
         self._status("Downloading Linux images (~500 MB)...")
         self._log("  This may take 5–15 minutes...", "warn")
@@ -1689,11 +1691,14 @@ class App(tk.Tk):
         
         if code == 0:
             self._log("  ✅  All images downloaded", "ok")
+            self._sprog(100)
+            self._mprog(78)
+            return True
         else:
-            self._log("  ⚠  Pull issues: " + err[:200], "warn")
-
-        self._sprog(100)
-        self._mprog(78)
+            self._log("  ❌  Pull failed!", "error")
+            self._log(f"  Error: {err[:300] if err else out[:300]}", "error")
+            self._log("  Check internet and try: wsl --shutdown", "warn")
+            return False
 
     def _do_start(self, ip, https_port):
         self._log("\n─── Starting Nextcloud ───────────────────", "info")
@@ -1765,7 +1770,7 @@ class App(tk.Tk):
             self._log("  (Skipping Windows auto-start/firewall on Linux)", "dim")
 
         # Wait for HTTP response - HARDENED HEALTH CHECK
-        self._log("\n  Checking site health (https://{ip}:{https_port})...", "dim")
+        self._log(f"\n  Checking site health (https://{ip}:{https_port})...", "dim")
         url = f"https://{ip}:{https_port}"
         ctx = ssl_module.create_default_context()
         ctx.check_hostname = False
@@ -1788,6 +1793,8 @@ class App(tk.Tk):
         
         if not responding:
             self._log("  ❌  Nextcloud failed to respond. Check Docker logs.", "error")
+            self._log("      HINT: Ensure no other web server is on port 8443.", "warn")
+            self._log("      HINT: Check if Docker is running in WSL (wsl --list -v).", "warn")
             self._status("Health check failed — site unreachable")
             return False
 
